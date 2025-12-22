@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Box Breaker</title>
+    <title>BOX BREAKER</title>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&display=swap');
 
@@ -157,6 +157,11 @@
         @media (hover: none) and (pointer: coarse) {
             .mobile-controls { display: flex; }
             h1 { font-size: 2rem; }
+            .control-circle {
+                width: 80px; /* Larger touch targets */
+                height: 80px;
+                font-size: 12px;
+            }
         }
         .control-circle {
             width: 60px;
@@ -287,7 +292,7 @@ resize();
 const input = {
     keys: {},
     mouse: { x: 0, y: 0, down: false },
-    touch: { active: false, startX: 0, startY: 0, currX: 0, currY: 0, joystickActive: false }
+    touch: { active: false, startX: 0, startY: 0, currX: 0, currY: 0, joystickActive: false, id: null }
 };
 
 // Event Listeners
@@ -302,16 +307,14 @@ canvas.addEventListener('touchstart', e => {
     e.preventDefault();
     for (let i = 0; i < e.touches.length; i++) {
         const t = e.touches[i];
-        if (t.clientX < width / 2) {
-            // Left side: Joystick
+        if (t.clientX < width / 2 && !input.touch.joystickActive) { // Assign joystick if left side and not active
             input.touch.joystickActive = true;
             input.touch.startX = t.clientX;
             input.touch.startY = t.clientY;
             input.touch.currX = t.clientX;
             input.touch.currY = t.clientY;
             input.touch.id = t.identifier;
-        } else {
-            // Right side: Shoot
+        } else if (t.clientX >= width / 2) { // Right side: Shoot
             input.mouse.down = true;
             input.mouse.x = t.clientX;
             input.mouse.y = t.clientY;
@@ -326,7 +329,7 @@ canvas.addEventListener('touchmove', e => {
         if (input.touch.joystickActive && t.identifier === input.touch.id) {
             input.touch.currX = t.clientX;
             input.touch.currY = t.clientY;
-        } else if (t.clientX > width / 2) {
+        } else if (t.clientX >= width / 2) {
             input.mouse.x = t.clientX;
             input.mouse.y = t.clientY;
         }
@@ -335,21 +338,25 @@ canvas.addEventListener('touchmove', e => {
 
 canvas.addEventListener('touchend', e => {
     e.preventDefault();
-    // Check if joystick lifted
     let joystickStillActive = false;
+    let shootingStillActive = false;
+
+    // Check if the joystick touch is still active
     for (let i = 0; i < e.touches.length; i++) {
-        if (e.touches[i].identifier === input.touch.id) joystickStillActive = true;
+        if (e.touches[i].identifier === input.touch.id) {
+            joystickStillActive = true;
+        }
+        if (e.touches[i].clientX >= width / 2) {
+            shootingStillActive = true;
+        }
     }
+
     if (!joystickStillActive) {
         input.touch.joystickActive = false;
+        input.touch.id = null; // Clear ID
     }
     
-    // Simple logic: if no touches on right, stop shooting
-    let shooting = false;
-    for (let i = 0; i < e.touches.length; i++) {
-        if (e.touches[i].clientX > width/2) shooting = true;
-    }
-    input.mouse.down = shooting;
+    input.mouse.down = shootingStillActive; // Stop shooting if no right-side touches left
 }, {passive: false});
 
 
@@ -459,7 +466,8 @@ class Box {
         // Fill based on HP
         ctx.globalAlpha = 0.3;
         ctx.fillStyle = this.color;
-        const fillH = (this.hp / (this.type===1?5:2)) * this.h;
+        const initialMaxHp = this.type === 1 ? 5 : (this.type === 2 ? 1 : 2);
+        const fillH = (this.hp / initialMaxHp) * this.h;
         ctx.fillRect(this.x, this.y + (this.h - fillH), this.w, fillH);
         ctx.globalAlpha = 1;
         ctx.shadowBlur = 0;
@@ -473,7 +481,7 @@ class Box {
 }
 
 class Enemy {
-    constructor(player) {
+    constructor(player, baseSpeed) {
         const side = Math.floor(Math.random() * 4);
         if (side === 0) { this.x = rand(0, width); this.y = -50; }
         else if (side === 1) { this.x = width + 50; this.y = rand(0, height); }
@@ -482,7 +490,7 @@ class Enemy {
 
         this.player = player;
         this.r = 15;
-        this.speed = rand(1, 2.5);
+        this.speed = baseSpeed * rand(0.8, 1.2); // Apply some variation to base speed
         this.hp = 3;
         this.dead = false;
         this.color = '#f00';
@@ -542,15 +550,17 @@ class Player {
         this.y = height / 2;
         this.r = 15;
         this.color = '#0ff';
-        this.speed = 5;
+        this.speed = 6; // Slightly faster player base speed
         this.maxHp = 100;
         this.hp = 100;
         this.vx = 0;
         this.vy = 0;
         this.friction = 0.9;
         this.cooldown = 0;
+        this.fireRate = 8; // Faster firing rate (lower cooldown)
         this.weapon = 1; // 1 = Single, 3 = Triple
         this.weaponTimer = 0;
+        this.touchMoveMultiplier = 1.5; // Boost touch joystick movement
     }
     update() {
         // Movement
@@ -567,22 +577,22 @@ class Player {
             const jdx = input.touch.currX - input.touch.startX;
             const jdy = input.touch.currY - input.touch.startY;
             const dist = Math.sqrt(jdx*jdx + jdy*jdy);
-            const maxDist = 50;
+            const maxDist = 50; // Max visual drag for joystick
             const force = Math.min(dist, maxDist) / maxDist;
             const angle = Math.atan2(jdy, jdx);
-            dx = Math.cos(angle) * force;
-            dy = Math.sin(angle) * force;
+            dx = Math.cos(angle) * force * this.touchMoveMultiplier; // Apply multiplier
+            dy = Math.sin(angle) * force * this.touchMoveMultiplier;
             
             // Draw joystick debug
             ctx.save();
             ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
             ctx.lineWidth = 2;
             ctx.beginPath();
-            ctx.arc(input.touch.startX, input.touch.startY, 50, 0, Math.PI*2);
+            ctx.arc(input.touch.startX, input.touch.startY, maxDist, 0, Math.PI*2);
             ctx.stroke();
             ctx.fillStyle = 'rgba(0, 255, 255, 0.5)';
             ctx.beginPath();
-            ctx.arc(input.touch.startX + Math.cos(angle)*Math.min(dist,50), input.touch.startY + Math.sin(angle)*Math.min(dist,50), 20, 0, Math.PI*2);
+            ctx.arc(input.touch.startX + Math.cos(angle)*Math.min(dist,maxDist), input.touch.startY + Math.sin(angle)*Math.min(dist,maxDist), 20, 0, Math.PI*2);
             ctx.fill();
             ctx.restore();
         }
@@ -647,13 +657,18 @@ let boxes = [];
 let enemies = [];
 let powerups = [];
 
+// Difficulty Variables
+let enemyBaseSpeed = 1;
+let enemySpawnFrequency = 240; // Frames per enemy spawn (240 frames = 4 seconds at 60fps)
+let maxActiveBoxes = 5; // Initial max boxes
+
 function spawnBox() {
     // Attempt to spawn without overlapping player
     for(let i=0; i<5; i++) {
         const x = rand(50, width - 90);
         const y = rand(50, height - 90);
         const dist = Math.sqrt((x-player.x)**2 + (y-player.y)**2);
-        if(dist > 150) {
+        if(dist > 150) { // Ensure boxes don't spawn right on top of player
             boxes.push(new Box(x, y));
             return;
         }
@@ -677,19 +692,37 @@ function initGame() {
     score = 0;
     frame = 0;
     
-    // Initial Boxes
-    for (let i = 0; i < 10; i++) spawnBox();
+    // Reset difficulty variables
+    enemyBaseSpeed = 1;
+    enemySpawnFrequency = 240;
+    maxActiveBoxes = 5;
+
+    // Initial Boxes (fewer at start)
+    for (let i = 0; i < maxActiveBoxes; i++) spawnBox();
 }
+
+function updateDifficulty() {
+    // Enemy Speed: Slowly increase enemy base speed
+    enemyBaseSpeed = 1 + Math.min(2, Math.floor(score / 2000) * 0.1); // Max speed increase of 2 (1 + 2 = 3)
+
+    // Enemy Spawn Rate: Very slowly decrease spawn frequency (more frequent spawns)
+    // Starts at 240 frames (4s), slowly drops towards 60 frames (1s)
+    enemySpawnFrequency = Math.max(60, 240 - Math.floor(score / 300));
+
+    // Max Active Boxes: Slowly increase the number of boxes
+    maxActiveBoxes = Math.min(20, 5 + Math.floor(score / 1500)); // Max 20 boxes
+}
+
 
 function update() {
     frame++;
+    updateDifficulty(); // Update difficulty based on score
+
+    // Spawning Boxes
+    if (frame % 120 === 0 && boxes.length < maxActiveBoxes) spawnBox();
     
-    // Spawning
-    if (frame % 120 === 0 && boxes.length < 20) spawnBox();
-    
-    // Enemy Spawn Logic (Gets harder)
-    let spawnRate = Math.max(30, 100 - Math.floor(score / 100));
-    if (frame % spawnRate === 0) enemies.push(new Enemy(player));
+    // Enemy Spawn Logic
+    if (frame % enemySpawnFrequency === 0) enemies.push(new Enemy(player, enemyBaseSpeed));
 
     // Player Logic
     player.update();
@@ -704,7 +737,7 @@ function update() {
             bullets.push(new Bullet(player.x, player.y, angle - 0.2));
             bullets.push(new Bullet(player.x, player.y, angle + 0.2));
         }
-        player.cooldown = 10;
+        player.cooldown = player.fireRate; // Use player's fire rate
         AudioSys.shoot();
     }
 
@@ -738,25 +771,24 @@ function update() {
                     if (box.type === 2) {
                         // Explode nearby boxes
                         boxes.forEach(other => {
-                            const d = Math.sqrt((other.x - box.x)**2 + (other.y - box.y)**2);
-                            if (d < 200 && other !== box) {
-                                other.hp = 0;
+                            const d = Math.sqrt((other.x - (box.x + box.w/2))**2 + (other.y - (box.y + box.h/2))**2);
+                            if (d < 200 && other !== box && !other.dead) { // Ensure not already dead
+                                other.hp = 0; // Destroy immediately
                                 other.dead = true;
                                 score += 20;
-                                createExplosion(other.x, other.y, '#f0f', 10);
+                                createExplosion(other.x + other.w/2, other.y + other.h/2, '#f0f', 10);
                             }
                         });
                         // Clear nearby enemies
                         enemies.forEach(en => {
-                             const d = Math.sqrt((en.x - box.x)**2 + (en.y - box.y)**2);
-                             if (d < 250) {
+                             const d = Math.sqrt((en.x - (box.x + box.w/2))**2 + (en.y - (box.y + box.h/2))**2);
+                             if (d < 250 && !en.dead) {
                                  en.dead = true;
                                  createExplosion(en.x, en.y, '#f00', 15);
                                  score += 100;
                              }
                         });
-                        // Screen shake effect (simulated by offsetting canvas context next frame, simplified here)
-                        vibrate(100);
+                        vibrate(100); // Stronger vibration for puzzle explosion
                     }
 
                     // Drop Powerup Chance
@@ -840,9 +872,12 @@ function draw() {
     ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
     ctx.lineWidth = 1;
     const gridSize = 50;
-    const offset = (frame * 2) % gridSize;
+    const offset = (frame * 0.5) % gridSize; // Slower grid movement
     for (let x = 0; x < width; x+=gridSize) {
-        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, height); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(x + offset, 0); ctx.lineTo(x + offset, height); ctx.stroke();
+    }
+    for (let y = 0; y < height; y+=gridSize) {
+        ctx.beginPath(); ctx.moveTo(0, y + offset); ctx.lineTo(width, y + offset); ctx.stroke();
     }
     
     boxes.forEach(b => b.draw(ctx));
@@ -871,7 +906,7 @@ function startGame() {
     document.getElementById('startScreen').classList.add('hidden');
     document.getElementById('gameOverScreen').classList.add('hidden');
     
-    AudioSys.init();
+    AudioSys.init(); // Initialize audio context on user interaction
     initGame();
     loop();
 }
@@ -887,16 +922,22 @@ function gameOver() {
 
 function updateLeaderboard(newScore) {
     let scores = JSON.parse(localStorage.getItem('neon_scores') || '[]');
-    scores.push({date: new Date().toLocaleDateString(), score: newScore});
+    if (newScore > 0) { // Only add if it's a real score
+        scores.push({date: new Date().toLocaleDateString(), score: newScore});
+    }
     scores.sort((a, b) => b.score - a.score);
     scores = scores.slice(0, 5); // Keep top 5
     localStorage.setItem('neon_scores', JSON.stringify(scores));
 
     const lbDiv = document.getElementById('leaderboardContent');
     lbDiv.innerHTML = '<h3>HIGH SCORES</h3>';
-    scores.forEach((s, i) => {
-        lbDiv.innerHTML += `<div class="lb-row"><span>${i+1}. ${s.date}</span><span>${s.score}</span></div>`;
-    });
+    if (scores.length === 0) {
+        lbDiv.innerHTML += '<p>No scores yet.</p>';
+    } else {
+        scores.forEach((s, i) => {
+            lbDiv.innerHTML += `<div class="lb-row"><span>${i+1}. ${s.date}</span><span>${s.score}</span></div>`;
+        });
+    }
 }
 
 // Initial Leaderboard Load
