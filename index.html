@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -176,6 +175,34 @@
             font-size: 10px;
         }
 
+        /* Multiplayer UI */
+        .mp-panel {
+            margin-top: 20px;
+            text-align: left;
+            background: rgba(0,0,0,0.6);
+            padding: 12px;
+            border: 1px solid var(--primary);
+            max-width: 480px;
+            margin-left: auto;
+            margin-right: auto;
+            border-radius: 6px;
+        }
+        .mp-row {
+            display:flex;
+            gap:8px;
+            margin-top:8px;
+            flex-wrap:wrap;
+        }
+        .qr {
+            margin-top: 12px;
+        }
+        .mono {
+            font-family: monospace;
+            font-size: 0.9rem;
+            color: #0ff;
+            word-break: break-all;
+        }
+
     </style>
 </head>
 <body>
@@ -196,8 +223,58 @@
             <h1>NEON FRAGMENT</h1>
             <p>Destroy Purple Boxes for Chain Reactions</p>
             <p>WASD/Touch to Move | Click/Tap to Shoot</p>
-            <button class="btn" onclick="startGame()">INITIATE</button>
+            <div class="mp-row">
+                <button class="btn" onclick="showSingle()">INITIATE</button>
+                <button class="btn" onclick="showMultiplayer()">MULTIPLAYER</button>
+            </div>
         </div>
+
+        <div class="menu-box hidden" id="mpScreen">
+            <h1>MULTIPLAYER</h1>
+            <p>Host or Join a session. Host creates an invite (link/QR). Joiners open it and share the answer back to the Host (QR or paste).</p>
+
+            <div class="mp-panel" id="mpPanel">
+                <div class="mp-row">
+                    <button class="btn" onclick="startHost()">Host Session</button>
+                    <button class="btn" onclick="prepareJoin()">Join Session</button>
+                    <button class="btn" onclick="backToMain()">Back</button>
+                </div>
+
+                <div id="hostArea" class="" style="display:none;">
+                    <h3>Host Controls</h3>
+                    <div id="inviteInfo"></div>
+                    <div id="inviteQR" class="qr"></div>
+                    <div style="margin-top:10px;">
+                        <label class="mono">Paste Answer from joiner:</label>
+                        <textarea id="answerPaste" style="width:100%;height:80px;background:#000;color:#0ff;border:1px solid #0ff;"></textarea>
+                        <div class="mp-row" style="margin-top:8px;">
+                            <button class="btn" onclick="applyAnswer()">Apply Answer</button>
+                            <button class="btn" onclick="createInvite()">Create Another Invite</button>
+                        </div>
+                    </div>
+                    <div id="connections" style="margin-top:12px;color:#ddd;"></div>
+                </div>
+
+                <div id="joinArea" style="display:none;">
+                    <h3>Join Controls</h3>
+                    <div id="offerInfo"></div>
+                    <div style="margin-top:8px;">
+                        <label class="mono">If you opened an invite link, it will be detected and an Answer will be generated. Copy/QR it to give to the Host.</label>
+                    </div>
+                    <div id="answerOut" style="margin-top:10px;"></div>
+                    <div style="margin-top:8px;">
+                        <label class="mono">Or paste an Offer here (if host gave you offer text):</label>
+                        <textarea id="offerPaste" style="width:100%;height:80px;background:#000;color:#0ff;border:1px solid #0ff;"></textarea>
+                        <div class="mp-row" style="margin-top:8px;">
+                            <button class="btn" onclick="createAnswerFromPaste()">Create Answer</button>
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+
+        </div>
+
         <div class="menu-box hidden" id="gameOverScreen">
             <h1>SYSTEM FAILURE</h1>
             <h2 id="finalScore">Score: 0</h2>
@@ -209,6 +286,19 @@
     <canvas id="gameCanvas"></canvas>
 
 <script>
+/**
+ * Multiplayer additions summary:
+ * - Manual WebRTC signaling via offer/answer that can be shared as text or QR code.
+ * - Host is authoritative: game state runs on host and is broadcast to connected peers via DataChannels.
+ * - Clients send only inputs (movement/shot) to host; host applies inputs to remote players and includes remote players in the authoritative simulation.
+ * - No external signaling server required — invites are encoded into links (hash) that contain base64 SDP. For the final handshake, the joining player creates an Answer and shares it back to the Host (paste/QR).
+ *
+ * Notes/limitations:
+ * - This is a front-end-only peer system using manual exchange (host creates invites, joiner opens them and returns answers).
+ * - Host must accept the answer by pasting/scanning it into the Host UI.
+ * - Multiple players: Host creates a separate invite for each joiner (press "Create Another Invite").
+ */
+
 /**
  * AUDIO ENGINE (Synthesizer)
  * Generates sounds on the fly using Web Audio API to keep file size small.
@@ -379,6 +469,16 @@ const checkCircleRect = (circle, rect) => {
 const vibrate = (ms) => {
     if (navigator.vibrate) navigator.vibrate(ms);
 };
+
+function sdpToBase64(sdp) {
+    return btoa(unescape(encodeURIComponent(sdp)));
+}
+function base64ToSdp(b64) {
+    return decodeURIComponent(escape(atob(b64)));
+}
+function shortId() {
+    return Math.random().toString(36).slice(2,9);
+}
 
 /**
  * GAME OBJECTS
@@ -563,42 +663,25 @@ class Player {
         this.weaponTimer = 0;
         this.touchMoveMultiplier = 1.5; // Boost touch joystick movement
     }
-    update() {
+    updateFromInput(localInput) {
+        // Called for host-controlled players (including host's own player)
         // Movement
         let dx = 0;
         let dy = 0;
 
-        if (input.keys['w'] || input.keys['arrowup']) dy = -1;
-        if (input.keys['s'] || input.keys['arrowdown']) dy = 1;
-        if (input.keys['a'] || input.keys['arrowleft']) dx = -1;
-        if (input.keys['d'] || input.keys['arrowright']) dx = 1;
+        if (localInput.keys && (localInput.keys['w'] || localInput.keys['arrowup'])) dy = -1;
+        if (localInput.keys && (localInput.keys['s'] || localInput.keys['arrowdown'])) dy = 1;
+        if (localInput.keys && (localInput.keys['a'] || localInput.keys['arrowleft'])) dx = -1;
+        if (localInput.keys && (localInput.keys['d'] || localInput.keys['arrowright'])) dx = 1;
 
-        // Touch Joystick
-        if (input.touch.joystickActive) {
-            const jdx = input.touch.currX - input.touch.startX;
-            const jdy = input.touch.currY - input.touch.startY;
-            const dist = Math.sqrt(jdx*jdx + jdy*jdy);
-            const maxDist = 50; // Max visual drag for joystick
-            const force = Math.min(dist, maxDist) / maxDist;
-            const angle = Math.atan2(jdy, jdx);
-            dx = Math.cos(angle) * force * this.touchMoveMultiplier; // Apply multiplier
-            dy = Math.sin(angle) * force * this.touchMoveMultiplier;
-            
-            // Draw joystick debug
-            ctx.save();
-            ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
-            ctx.lineWidth = 2;
-            ctx.beginPath();
-            ctx.arc(input.touch.startX, input.touch.startY, maxDist, 0, Math.PI*2);
-            ctx.stroke();
-            ctx.fillStyle = 'rgba(0, 255, 255, 0.5)';
-            ctx.beginPath();
-            ctx.arc(input.touch.startX + Math.cos(angle)*Math.min(dist,maxDist), input.touch.startY + Math.sin(angle)*Math.min(dist,maxDist), 20, 0, Math.PI*2);
-            ctx.fill();
-            ctx.restore();
+        // Touch joystick fields for remote inputs might supply moveX/moveY
+        if (typeof localInput.moveX === 'number' || typeof localInput.moveY === 'number') {
+            if (Math.abs(localInput.moveX) > 0.001 || Math.abs(localInput.moveY) > 0.001) {
+                dx = localInput.moveX;
+                dy = localInput.moveY;
+            }
         }
 
-        // Apply acceleration
         if (dx !== 0 || dy !== 0) {
             this.vx += dx * 0.8;
             this.vy += dy * 0.8;
@@ -642,6 +725,456 @@ class Player {
         ctx.arc(this.x, this.y, this.r * 0.5, 0, Math.PI * 2);
         ctx.fill();
         ctx.shadowBlur = 0;
+    }
+}
+
+/**
+ * MULTIPLAYER STATE
+ */
+let isHost = false;
+let isClient = false;
+let peers = {}; // inviteId -> {pc,dc,connected,remoteId}
+let remoteInputs = {}; // clientId -> latest input object (for host)
+let remotePlayers = {}; // clientId -> Player instance (host authoritative)
+let clientId = null; // this client's id (if client)
+let hostInviteId = null; // current invite id (host-side)
+let broadcastInterval = null;
+
+/**
+ * WebRTC helpers (manual invite flow)
+ */
+const rtcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+
+async function createInvite() {
+    // Host creates a PeerConnection and DataChannel, makes an offer, and encodes it into a link
+    const invite = shortId();
+    hostInviteId = invite;
+    const pc = new RTCPeerConnection(rtcConfig);
+    const dc = pc.createDataChannel('game', { ordered: true });
+
+    peers[invite] = { pc, dc, connected: false, remoteClientId: null };
+
+    dc.onopen = () => {
+        peers[invite].connected = true;
+        updateConnectionsUI();
+    };
+    dc.onmessage = ev => {
+        handleClientMessage(invite, ev.data);
+    };
+
+    pc.onicecandidate = e => {
+        // Wait until complete gathering OR send progressive candidates via the same manual flow
+        // For simplicity we wait for complete gathering by watching pc.localDescription.sdp when all candidates done.
+        // Some browsers provide trickle ICE; we still produce the SDP and the joiner will setRemoteDescription and create answer with their ICE candidates.
+        // Note: this manual approach works best when both sides can gather ICE candidates before exchanging.
+    };
+
+    // create offer
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+
+    // Wait briefly for ICE candidates to be gathered (not perfect but helps)
+    await new Promise(resolve => setTimeout(resolve, 700));
+
+    const sdp = pc.localDescription.sdp;
+    const b64 = sdpToBase64(sdp);
+    const inviteLink = window.location.href.split('#')[0] + `#invite=${invite}&offer=${b64}`;
+
+    // Show invite link + QR
+    const inviteInfo = document.getElementById('inviteInfo');
+    inviteInfo.innerHTML = `<div class="mono">Invite ID: ${invite}</div><div class="mono" style="margin-top:6px">Invite Link (share or scan QR):</div><div class="mono">${inviteLink}</div>`;
+
+    // Use free QR API to show QR (works with encoded data)
+    const qrImg = document.getElementById('inviteQR');
+    qrImg.innerHTML = `<img src="https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=${encodeURIComponent(inviteLink)}" alt="QR">`;
+
+    updateConnectionsUI();
+    return invite;
+}
+
+async function applyAnswer() {
+    // Host pastes answer into textarea; we'll match it to the latest invite id (or pick one)
+    const txt = document.getElementById('answerPaste').value.trim();
+    if (!txt) return alert('Paste the Answer (base64 SDP) from the joiner.');
+    // the answer should be in format invite=ID&answer=BASE64 or simply BASE64. Support both.
+    let answerB64 = txt;
+    let matchedInvite = hostInviteId;
+    // If user pasted a URL/hash with invite key:
+    if (txt.includes('invite=') && txt.includes('answer=')) {
+        try {
+            const params = {};
+            txt.split('#')[1].split('&').forEach(p => {
+                const [k,v] = p.split('=');
+                params[k]=v;
+            });
+            if (params.invite) matchedInvite = params.invite;
+            if (params.answer) answerB64 = params.answer;
+        } catch(e){}
+    } else if (txt.includes('answer=')) {
+        try {
+            answerB64 = txt.split('answer=')[1];
+        } catch(e){}
+    }
+
+    if (!matchedInvite || !peers[matchedInvite]) {
+        // try to find any peer that isn't connected yet
+        const candidate = Object.keys(peers).find(k => !peers[k].connected);
+        if (candidate) matchedInvite = candidate;
+        else return alert('No matching invite found. Create an invite first.');
+    }
+
+    const pc = peers[matchedInvite].pc;
+    try {
+        const sdp = base64ToSdp(answerB64);
+        await pc.setRemoteDescription({ type: 'answer', sdp });
+        // mark connected; DataChannel onopen will set connected flag
+        updateConnectionsUI();
+        document.getElementById('answerPaste').value = '';
+    } catch(e) {
+        console.error(e);
+        alert('Failed to apply answer. Ensure the pasted answer is correct and complete.');
+    }
+}
+
+function handleClientMessage(inviteId, raw) {
+    // Called on Host when a client sends messages
+    try {
+        const msg = JSON.parse(raw);
+        if (!msg.type) return;
+        if (msg.type === 'join') {
+            // register client id; create remote player
+            const client = msg.id || shortId();
+            peers[inviteId].remoteClientId = client;
+            remoteInputs[client] = {}; // init
+            // create remote player at requested spawn or near host player
+            const spawnX = (msg.spawn && msg.spawn.x) ? msg.spawn.x * width : player.x + rand(-50,50);
+            const spawnY = (msg.spawn && msg.spawn.y) ? msg.spawn.y * height : player.y + rand(-50,50);
+            const p = new Player();
+            p.x = spawnX;
+            p.y = spawnY;
+            p.color = '#'+(Math.random()*0xFFFFFF<<0).toString(16).padStart(6,'0');
+            remotePlayers[client] = p;
+            updateConnectionsUI();
+        } else if (msg.type === 'input') {
+            if (msg.id) remoteInputs[msg.id] = msg;
+            else console.warn('input without id');
+        }
+    } catch(e) {
+        console.warn('non-json message', raw);
+    }
+}
+
+/**
+ * Joiner flow: when a visitor opens a link with offer in hash, create an answer and show it for host.
+ */
+async function prepareJoin() {
+    document.getElementById('startScreen').classList.add('hidden');
+    document.getElementById('mpScreen').classList.remove('hidden');
+
+    document.getElementById('hostArea').style.display = 'none';
+    document.getElementById('joinArea').style.display = 'block';
+}
+
+async function createAnswerFromOffer(inviteId, offerB64) {
+    // Joins an offer provided in the URL
+    const sdp = base64ToSdp(offerB64);
+    const pc = new RTCPeerConnection(rtcConfig);
+
+    clientId = shortId();
+
+    pc.ondatachannel = ev => {
+        const dc = ev.channel;
+        dc.onopen = () => {
+            isClient = true;
+            // join by sending join message
+            const joinMsg = { type:'join', id: clientId, spawn: { x: 0.5, y: 0.5 } };
+            dc.send(JSON.stringify(joinMsg));
+            // start sending inputs periodically on animation frame
+        };
+        dc.onmessage = msgEv => {
+            try {
+                const data = JSON.parse(msgEv.data);
+                if (data.type === 'state') {
+                    applyStateFromHost(data);
+                }
+            } catch(e) {
+                // ignore
+            }
+        };
+        // save to window for sending input
+        window._clientDC = dc;
+    };
+
+    await pc.setRemoteDescription({ type:'offer', sdp });
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+
+    // Wait a bit for ICE
+    await new Promise(r => setTimeout(r, 700));
+
+    const answerB64 = sdpToBase64(pc.localDescription.sdp);
+
+    // Provide answer text and a QR (so host can scan OR paste)
+    const ansOut = document.getElementById('answerOut');
+    ansOut.innerHTML = `<div class="mono">Answer (give to Host):</div><textarea readonly style="width:100%;height:80px;background:#000;color:#0ff;border:1px solid #0ff;">${answerB64}</textarea>
+        <div class="qr"><img src="https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=${encodeURIComponent(window.location.href.split('#')[0] + '#answer=' + answerB64)}" alt="QR"></div>`;
+
+    // Also offer a combined string with invite & answer for easier paste
+    const combined = `invite=${inviteId}&answer=${answerB64}`;
+    ansOut.innerHTML += `<div style="margin-top:8px;"><div class="mono">Combined (quick paste for Host):</div><textarea readonly style="width:100%;height:50px;background:#000;color:#0ff;border:1px solid #0ff;">${combined}</textarea></div>`;
+
+    // Keep PC alive
+    window._clientPC = pc;
+    document.getElementById('offerInfo').innerText = `Prepared Answer for invite ${inviteId}.`;
+}
+
+function createAnswerFromPaste() {
+    const txt = document.getElementById('offerPaste').value.trim();
+    if (!txt) return alert('Paste the offer text (base64 offer or url/hash that includes offer=...)');
+    // try to parse
+    let offerB64 = txt;
+    if (txt.includes('offer=')) {
+        try {
+            offerB64 = txt.split('offer=')[1].split('&')[0];
+        } catch(e){}
+    }
+    // If the user pasted the full invite link (they may have)
+    if (txt.includes('#') && txt.includes('offer=')) {
+        try {
+            const after = txt.split('#')[1];
+            const params = {};
+            after.split('&').forEach(p => { const [k,v]=p.split('='); params[k]=v; });
+            if (params.offer && params.invite) {
+                offerB64 = params.offer;
+                createAnswerFromOffer(params.invite, offerB64);
+                return;
+            }
+        } catch(e){}
+    }
+    // No invite id in paste: create answer but host will need to indicate which invite it belongs to
+    createAnswerFromOffer('unknown', offerB64);
+}
+
+/**
+ * Host UI helpers
+ */
+function updateConnectionsUI() {
+    const c = document.getElementById('connections');
+    const lines = [];
+    for (const k of Object.keys(peers)) {
+        lines.push(`<div class="mono">Invite: ${k} | connected: ${peers[k].connected} | clientId: ${peers[k].remoteClientId || '-'}</div>`);
+    }
+    c.innerHTML = lines.join('');
+}
+
+/**
+ * Detect incoming invite when the page is loaded with a hash containing invite & offer
+ */
+window.addEventListener('load', () => {
+    const hash = window.location.hash.slice(1);
+    if (!hash) {
+        updateLeaderboard(0); // initial leaderboard load
+        return;
+    }
+    const params = {};
+    hash.split('&').forEach(p => {
+        const [k,v] = p.split('=');
+        params[k]=v;
+    });
+    if (params.invite && params.offer) {
+        // We're a joiner opening a host invite link
+        document.getElementById('startScreen').classList.add('hidden');
+        document.getElementById('mpScreen').classList.remove('hidden');
+        document.getElementById('hostArea').style.display = 'none';
+        document.getElementById('joinArea').style.display = 'block';
+        prepareJoin();
+        createAnswerFromOffer(params.invite, params.offer).catch(e => console.error(e));
+    } else if (params.answer) {
+        // Someone pasted an answer via link - this can be used by host when they open a combined link
+        // Put it into answerPaste for convenience
+        document.getElementById('answerPaste').value = params.answer;
+    }
+
+    // Also load leaderboard when page is opened normally
+    if (!params.invite) updateLeaderboard(0);
+});
+
+/**
+ * When acting as host, broadcast authoritative game state to all peers periodically.
+ */
+function startBroadcastingState() {
+    if (broadcastInterval) clearInterval(broadcastInterval);
+    broadcastInterval = setInterval(() => {
+        const state = {
+            type: 'state',
+            score,
+            players: [], // include host player + remote players
+            bullets: bullets.map(b => ({x:b.x,y:b.y,vx:b.vx,vy:b.vy,r:b.r,color:b.color})),
+            boxes: boxes.map(b => ({x:b.x,y:b.y,w:b.w,h:b.h,hp:b.hp,type:b.type,color:b.color})),
+            enemies: enemies.map(e => ({x:e.x,y:e.y,hp:e.hp,color:e.color})),
+            powerups: powerups.map(p => ({x:p.x,y:p.y,type:p.type}))
+        };
+        // players
+        // host player is always included
+        state.players.push({id: 'host', x: player.x, y: player.y, hp: player.hp, color: player.color, weapon: player.weapon});
+        for (const id of Object.keys(remotePlayers)) {
+            const rp = remotePlayers[id];
+            state.players.push({id, x: rp.x, y: rp.y, hp: rp.hp, color: rp.color, weapon: rp.weapon});
+        }
+
+        const s = JSON.stringify(state);
+        for (const k of Object.keys(peers)) {
+            const entry = peers[k];
+            if (entry.dc && entry.dc.readyState === 'open') {
+                try { entry.dc.send(s); } catch(e) { /* ignore send errors */ }
+            }
+        }
+    }, 1000/15); // 15 Hz
+}
+
+function stopBroadcasting() {
+    if (broadcastInterval) clearInterval(broadcastInterval);
+    broadcastInterval = null;
+}
+
+/**
+ * Host: create peer & invite UI
+ */
+async function startHost() {
+    isHost = true;
+    isClient = false;
+    document.getElementById('startScreen').classList.add('hidden');
+    document.getElementById('mpScreen').classList.remove('hidden');
+
+    document.getElementById('hostArea').style.display = 'block';
+    document.getElementById('joinArea').style.display = 'none';
+
+    await createInvite();
+    startBroadcastingState();
+}
+
+/**
+ * Client: Join flow from UI (manual paste)
+ */
+function startClientGame() {
+    // Called after we've established DataChannel and are receiving states
+    isClient = true;
+    isHost = false;
+
+    // Hide screens and go to game view
+    document.getElementById('screens').classList.add('hidden');
+    document.getElementById('startScreen').classList.add('hidden');
+    document.getElementById('mpScreen').classList.add('hidden');
+    document.getElementById('gameOverScreen').classList.add('hidden');
+
+    AudioSys.init(); // ensure audio unlocked
+    // clients will rely on states coming from host
+    loop();
+}
+
+/**
+ * Called by client when a 'state' message is received from host
+ */
+function applyStateFromHost(state) {
+    // Overwrite local arrays with authoritative ones
+    score = state.score || score;
+
+    // Rebuild boxes, bullets, enemies, powerups using constructors so draw() can reuse
+    boxes = (state.boxes || []).map(b => {
+        const bo = new Box(b.x, b.y);
+        bo.w = b.w; bo.h = b.h; bo.hp = b.hp; bo.type = b.type; bo.color = b.color;
+        return bo;
+    });
+    bullets = (state.bullets || []).map(b => {
+        const bl = new Bullet(b.x, b.y, 0);
+        bl.vx = b.vx; bl.vy = b.vy; bl.r = b.r; bl.color = b.color;
+        return bl;
+    });
+    enemies = (state.enemies || []).map(e => {
+        const en = new Enemy({x: width/2, y: height/2}, enemyBaseSpeed);
+        en.x = e.x; en.y = e.y; en.hp = e.hp; en.color = e.color;
+        return en;
+    });
+    powerups = (state.powerups || []).map(p => {
+        const pu = new Powerup(p.x, p.y);
+        pu.type = p.type;
+        return pu;
+    });
+
+    // Players array: update local player and remote player representations
+    // Ensure we have a Player instance for ourselves and for other players
+    const playersArr = state.players || [];
+    // find my player id if known
+    for (const p of playersArr) {
+        if (p.id === clientId) {
+            // ensure player exists
+            if (!player) player = new Player();
+            player.x = p.x; player.y = p.y; player.hp = p.hp;
+        } else if (p.id === 'host') {
+            // represent host as another remote (if needed)
+            let idp = 'host';
+            if (!remotePlayers[idp]) {
+                const pr = new Player();
+                pr.x = p.x; pr.y = p.y; pr.color = p.color || '#0ff';
+                remotePlayers[idp] = pr;
+            } else {
+                remotePlayers[idp].x = p.x; remotePlayers[idp].y = p.y; remotePlayers[idp].hp = p.hp;
+            }
+        } else {
+            if (!remotePlayers[p.id]) {
+                const pr = new Player();
+                pr.x = p.x; pr.y = p.y; pr.color = p.color || '#0ff';
+                remotePlayers[p.id] = pr;
+            } else {
+                remotePlayers[p.id].x = p.x; remotePlayers[p.id].y = p.y; remotePlayers[p.id].hp = p.hp;
+            }
+        }
+    }
+
+    // Start client loop if not already running
+    if (!isClient) {
+        startClientGame();
+    }
+}
+
+/**
+ * Host side: apply remote inputs to remotePlayers
+ * - remoteInputs[clientId] should contain { moveX, moveY, aimX, aimY, shooting, id }
+ * - We'll create bullets on host when shooting events are received
+ */
+function processRemoteInputs() {
+    for (const id of Object.keys(remoteInputs)) {
+        const inp = remoteInputs[id];
+        if (!remotePlayers[id]) continue;
+        const rp = remotePlayers[id];
+
+        // Build a simplified localInput object used to update Player
+        const localInput = { keys: inp.keys || {}, moveX: inp.moveX, moveY: inp.moveY };
+        rp.updateFromInput(localInput);
+
+        // Shooting
+        if (inp.shooting && inp.shooting === true) {
+            // Respect fire rate by tracking a cooldown on rp
+            if (!rp.cooldown) rp.cooldown = 0;
+            if (rp.cooldown <= 0) {
+                // Use aim vector to compute angle if provided, otherwise default forward
+                let angle = 0;
+                if (typeof inp.aimX === 'number' && typeof inp.aimY === 'number') {
+                    angle = Math.atan2(inp.aimY, inp.aimX);
+                } else {
+                    angle = 0;
+                }
+                bullets.push(new Bullet(rp.x, rp.y, angle));
+                if (rp.weapon === 3) {
+                    bullets.push(new Bullet(rp.x, rp.y, angle - 0.2));
+                    bullets.push(new Bullet(rp.x, rp.y, angle + 0.2));
+                }
+                rp.cooldown = rp.fireRate || 8;
+                AudioSys.shoot();
+            } else {
+                rp.cooldown--;
+            }
+        }
     }
 }
 
@@ -719,6 +1252,18 @@ function update() {
     frame++;
     updateDifficulty(); // Update difficulty based on score
 
+    // If client mode (non-host), skip authoritative spawning & physics; rely on host state
+    if (isClient && !isHost) {
+        // Update particles and bullets for visual smoothing
+        bullets.forEach(b => b.update());
+        particles.forEach(p => p.update());
+        // UI only (score comes from host)
+        document.getElementById('score').innerText = `SCORE: ${score}`;
+        // update hp bar if we have player object
+        if (player) document.getElementById('hpBar').style.width = `${player.hp}%`;
+        return;
+    }
+
     // Spawning Boxes
     if (frame % 120 === 0 && boxes.length < maxActiveBoxes) spawnBox();
     
@@ -726,11 +1271,14 @@ function update() {
     if (frame % enemySpawnFrequency === 0) enemies.push(new Enemy(player, enemyBaseSpeed));
 
     // Player Logic
-    player.update();
+    player.updateFromInput({ keys: input.keys, moveX: 0, moveY: 0 });
     if (player.cooldown > 0) player.cooldown--;
     
-    // Shooting
-    if (input.mouse.down && player.cooldown <= 0) {
+    // Host: process remote inputs and potentially spawn bullets for remote players
+    if (isHost) processRemoteInputs();
+
+    // Shooting - local player
+    if (input.mouse.down && player.cooldown <= 0 && !isClient) {
         const angle = Math.atan2(input.mouse.y - player.y, input.mouse.x - player.x);
         
         bullets.push(new Bullet(player.x, player.y, angle));
@@ -740,6 +1288,8 @@ function update() {
         }
         player.cooldown = player.fireRate; // Use player's fire rate
         AudioSys.shoot();
+
+        // If host, optionally notify clients? host will broadcast full state so no extra messaging required
     }
 
     // Entities Update & Clean
@@ -844,6 +1394,9 @@ function update() {
         }
     }
 
+    // Update remote player collisions vs environment (optional)
+    // Could also apply enemy collisions with remote players: for brevity this demo doesn't handle remote player collisions with enemies/boxes extensively.
+
     // Cleanup arrays
     bullets = bullets.filter(b => !b.dead);
     particles = particles.filter(p => p.alpha > 0);
@@ -883,7 +1436,13 @@ function draw() {
     
     boxes.forEach(b => b.draw(ctx));
     powerups.forEach(p => p.draw(ctx));
-    player.draw(ctx);
+    // draw host player and remote players
+    if (player) player.draw(ctx);
+    // remotePlayers map
+    for (const id of Object.keys(remotePlayers)) {
+        const rp = remotePlayers[id];
+        if (rp) rp.draw(ctx);
+    }
     bullets.forEach(b => b.draw(ctx));
     enemies.forEach(e => e.draw(ctx));
     particles.forEach(p => p.draw(ctx));
@@ -894,7 +1453,11 @@ function draw() {
 function loop() {
     update();
     draw();
-    if (player.hp > 0) {
+    if (!isClient || isHost) {
+        // host or singleplayer runs authoritative loop
+        gameLoopId = requestAnimationFrame(loop);
+    } else {
+        // client uses loop but we still want animation
         gameLoopId = requestAnimationFrame(loop);
     }
 }
@@ -902,7 +1465,28 @@ function loop() {
 /**
  * GAME STATE MANAGEMENT
  */
+function showSingle() {
+    document.getElementById('startScreen').classList.add('hidden');
+    document.getElementById('screens').classList.add('hidden');
+    AudioSys.init();
+    initGame();
+    loop();
+}
+
+function showMultiplayer() {
+    document.getElementById('startScreen').classList.add('hidden');
+    document.getElementById('mpScreen').classList.remove('hidden');
+    document.getElementById('hostArea').style.display = 'none';
+    document.getElementById('joinArea').style.display = 'none';
+}
+
+function backToMain() {
+    document.getElementById('mpScreen').classList.add('hidden');
+    document.getElementById('startScreen').classList.remove('hidden');
+}
+
 function startGame() {
+    // default singleplayer start (keeps same behavior)
     document.getElementById('screens').classList.add('hidden');
     document.getElementById('startScreen').classList.add('hidden');
     document.getElementById('gameOverScreen').classList.add('hidden');
@@ -921,6 +1505,9 @@ function gameOver() {
     updateLeaderboard(score);
 }
 
+/**
+ * Leaderboard
+ */
 function updateLeaderboard(newScore) {
     let scores = JSON.parse(localStorage.getItem('neon_scores') || '[]');
     if (newScore > 0) { // Only add if it's a real score
@@ -942,7 +1529,74 @@ function updateLeaderboard(newScore) {
 }
 
 // Initial Leaderboard Load
-updateLeaderboard(0);
+// updateLeaderboard(0); -- this is triggered on load earlier
+
+/**
+ * Client: send input state to host regularly
+ */
+function gatherLocalInputForClient() {
+    // compute movement vector
+    let moveX = 0, moveY = 0;
+    if (input.keys['w'] || input.keys['arrowup']) moveY = -1;
+    if (input.keys['s'] || input.keys['arrowdown']) moveY = 1;
+    if (input.keys['a'] || input.keys['arrowleft']) moveX = -1;
+    if (input.keys['d'] || input.keys['arrowright']) moveX = 1;
+
+    // joystick override
+    if (input.touch.joystickActive) {
+        const jdx = input.touch.currX - input.touch.startX;
+        const jdy = input.touch.currY - input.touch.startY;
+        const dist = Math.sqrt(jdx*jdx + jdy*jdy);
+        const maxDist = 50;
+        const force = Math.min(dist, maxDist) / maxDist;
+        const angle = Math.atan2(jdy, jdx);
+        moveX = Math.cos(angle) * force;
+        moveY = Math.sin(angle) * force;
+    }
+
+    // aim vector: direction from (center of screen / estimated player position) to mouse
+    let aimX = input.mouse.x - (player ? player.x : width/2);
+    let aimY = input.mouse.y - (player ? player.y : height/2);
+    const dist = Math.sqrt(aimX*aimX + aimY*aimY);
+    if (dist > 0.00001) { aimX /= dist; aimY /= dist; }
+    const msg = {
+        type:'input',
+        id: clientId,
+        moveX, moveY,
+        aimX, aimY,
+        shooting: input.mouse.down,
+        keys: input.keys
+    };
+    if (window._clientDC && window._clientDC.readyState === 'open') {
+        try { window._clientDC.send(JSON.stringify(msg)); } catch(e) {}
+    }
+}
+
+// send inputs at ~30Hz
+setInterval(() => {
+    if (isClient && window._clientDC && window._clientDC.readyState === 'open') {
+        gatherLocalInputForClient();
+    }
+}, 1000/30);
+
+/**
+ * Convenience: when host creates initial invite at UI click
+ */
+function startHostUI() {
+    startHost().catch(console.error);
+}
+
+/**
+ * Utilities to expose some functions to UI buttons
+ */
+window.createInvite = createInvite;
+window.applyAnswer = applyAnswer;
+window.startHost = startHost;
+window.prepareJoin = prepareJoin;
+window.createAnswerFromPaste = createAnswerFromPaste;
+window.showSingle = showSingle;
+window.showMultiplayer = showMultiplayer;
+window.backToMain = backToMain;
 
 </script>
 </body>
