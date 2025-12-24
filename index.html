@@ -175,7 +175,47 @@
             font-size: 10px;
         }
 
+        /* Multiplayer UI styles */
+        #multiplayerPanel {
+            margin-top: 20px;
+            background: rgba(0,0,0,0.6);
+            padding: 15px;
+            border: 1px solid var(--primary);
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            justify-content: center;
+            flex-direction: column;
+        }
+        #qrCode {
+            width: 160px;
+            height: 160px;
+            background: white;
+            padding: 8px;
+        }
+        #playersList {
+            max-height: 120px;
+            overflow-y: auto;
+            width: 100%;
+            text-align: left;
+            color: #ddd;
+        }
+        .small {
+            font-size: 0.8rem;
+            color: #bbb;
+        }
+        input[type="text"] {
+            padding: 8px;
+            border-radius: 6px;
+            border: 1px solid #666;
+            background: rgba(255,255,255,0.03);
+            color: #fff;
+        }
     </style>
+
+    <!-- PeerJS (simple WebRTC datachannel wrapper) and QR code generator -->
+    <script src="https://unpkg.com/peerjs@1.4.7/dist/peerjs.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 </head>
 <body>
 
@@ -195,13 +235,43 @@
             <h1>NEON FRAGMENT</h1>
             <p>Destroy Purple Boxes for Chain Reactions</p>
             <p>WASD/Touch to Move | Click/Tap to Shoot</p>
-            <button class="btn" onclick="startGame()">INITIATE</button>
+            <div>
+                <button class="btn" onclick="startGame()">INITIATE</button>
+            </div>
+
+            <div id="multiplayerPanel">
+                <div style="display:flex; gap:10px; align-items:center;">
+                    <button class="btn" onclick="openHostPanel()">HOST MULTIPLAYER</button>
+                    <button class="btn" onclick="openJoinPanel()">JOIN MULTIPLAYER</button>
+                </div>
+                <div id="hostControls" class="hidden" style="width:100%; align-items:center;">
+                    <div class="small">Host ID: <span id="multiplayerHostId">-</span></div>
+                    <div id="qrCode"></div>
+                    <div style="display:flex; gap:10px;">
+                        <button class="btn" onclick="startGame('host')">START GAME (HOST)</button>
+                        <button class="btn" onclick="stopHosting()">STOP HOST</button>
+                    </div>
+                    <div id="playersList"><strong>Connected Players:</strong><div id="playersConnected"></div></div>
+                </div>
+                <div id="joinControls" class="hidden" style="width:100%; align-items:center;">
+                    <div class="small">Enter Host ID</div>
+                    <div style="display:flex; gap:8px;">
+                        <input id="hostIdToJoin" type="text" placeholder="Host ID">
+                        <button class="btn" onclick="joinById()">JOIN</button>
+                    </div>
+                    <div id="joinStatus" class="small">Or scan a host's QR code to join automatically.</div>
+                </div>
+            </div>
+
         </div>
         <div class="menu-box hidden" id="gameOverScreen">
             <h1>SYSTEM FAILURE</h1>
             <h2 id="finalScore">Score: 0</h2>
             <div class="leaderboard" id="leaderboardContent"></div>
-            <button class="btn" onclick="startGame()">REBOOT</button>
+            <div style="display:flex; gap:8px; justify-content:center;">
+                <button class="btn" onclick="startGame()">REBOOT</button>
+                <button class="btn" onclick="openJoinPanel()">JOIN MULTIPLAYER</button>
+            </div>
         </div>
     </div>
 
@@ -378,6 +448,11 @@ const checkCircleRect = (circle, rect) => {
 const vibrate = (ms) => {
     if (navigator.vibrate) navigator.vibrate(ms);
 };
+
+function getJoinUrl(hostId) {
+    const base = window.location.href.split('?')[0];
+    return `${base}?join=${encodeURIComponent(hostId)}`;
+}
 
 /**
  * GAME OBJECTS
@@ -645,6 +720,294 @@ class Player {
 }
 
 /**
+ * NETWORK (Multiplayer using PeerJS)
+ *
+ * Host: starts a PeerJS peer and accepts connections. Host runs authoritative simulation.
+ * Clients: connect to host's peer id; they send input messages and render server snapshots.
+ */
+
+let peer = null;
+let isHost = false;
+let isClient = false;
+let hostId = null;
+let connections = []; // array of DataConnection (for host)
+let clientsMap = {};  // host-side: store client player states keyed by peer id
+let clientConn = null; // client-side connection to host
+let serverState = null; // client-side last received state
+let qrcodeInstance = null;
+let playersListEl = document.getElementById('playersConnected');
+
+// Setup host panel / join panel
+function openHostPanel() {
+    document.getElementById('hostControls').classList.remove('hidden');
+    document.getElementById('joinControls').classList.add('hidden');
+    if (!peer) {
+        startHosting();
+    }
+}
+function openJoinPanel() {
+    document.getElementById('joinControls').classList.remove('hidden');
+    document.getElementById('hostControls').classList.add('hidden');
+    // If there's a join param in URL, auto-fill and try to connect
+    const urlParams = new URLSearchParams(window.location.search);
+    const joinId = urlParams.get('join');
+    if (joinId) {
+        document.getElementById('hostIdToJoin').value = joinId;
+        // Auto attempt to join (user still needs to press JOIN to ensure user gesture for audio etc)
+    }
+}
+
+function startHosting() {
+    if (peer) return;
+    // Create a peer (uses default PeerJS cloud server)
+    peer = new Peer();
+    peer.on('open', id => {
+        hostId = id;
+        document.getElementById('multiplayerHostId').innerText = id;
+        const joinUrl = getJoinUrl(id);
+        // Generate QR
+        const qrEl = document.getElementById('qrCode');
+        qrEl.innerHTML = '';
+        qrcodeInstance = new QRCode(qrEl, {
+            text: joinUrl,
+            width: 160,
+            height: 160,
+            colorDark : "#000000",
+            colorLight : "#ffffff",
+            correctLevel : QRCode.CorrectLevel.M
+        });
+    });
+
+    peer.on('connection', conn => {
+        conn.on('open', () => {
+            connections.push(conn);
+            // initialize remote player representation
+            clientsMap[conn.peer] = {
+                x: width/2 + rand(-100,100),
+                y: height/2 + rand(-100,100),
+                vx: 0, vy: 0, r: 14,
+                color: '#'+Math.floor(Math.random()*16777215).toString(16),
+                cooldown: 0,
+                fireRate: 8,
+                weapon: 1
+            };
+            updateHostPlayersUI();
+            // send init payload
+            conn.send({type:'init', payload:{hostId: hostId}});
+        });
+
+        conn.on('data', data => {
+            // handle client messages (inputs, join)
+            if (!data || !data.type) return;
+            if (data.type === 'join') {
+                // Already tracked via open handler
+            } else if (data.type === 'input') {
+                // store input for processing in host update
+                const p = clientsMap[conn.peer];
+                if (p) {
+                    p.lastInput = data.payload;
+                }
+            }
+        });
+
+        conn.on('close', () => {
+            // remove client
+            delete clientsMap[conn.peer];
+            connections = connections.filter(c => c !== conn);
+            updateHostPlayersUI();
+        });
+    });
+
+    peer.on('error', (err) => {
+        console.error('Peer error', err);
+    });
+}
+
+function stopHosting() {
+    if (!peer) return;
+    // close existing connections
+    connections.forEach(c => {
+        try { c.close(); } catch(e){}
+    });
+    connections = [];
+    clientsMap = {};
+    if (peer && peer.destroy) peer.destroy();
+    peer = null;
+    hostId = null;
+    document.getElementById('multiplayerHostId').innerText = '-';
+    const qrEl = document.getElementById('qrCode'); qrEl.innerHTML = '';
+    if (qrcodeInstance) qrcodeInstance.clear();
+    updateHostPlayersUI();
+}
+
+/**
+ * Host: called every N frames to broadcast current authoritative state to clients
+ */
+function broadcastStateToClients() {
+    if (!isHost) return;
+    const state = {
+        players: [], // include host player as 'host' id and each client
+        bullets: bullets.map(b => ({x:b.x,y:b.y,vx:b.vx,vy:b.vy,r:b.r,color:b.color})),
+        boxes: boxes.map(b => ({x:b.x,y:b.y,w:b.w,h:b.h,hp:b.hp,type:b.type,dead:b.dead,color:b.color})),
+        enemies: enemies.map(e => ({x:e.x,y:e.y,r:e.r,hp:e.hp,color:e.color})),
+        powerups: powerups.map(p => ({x:p.x,y:p.y,r:p.r,type:p.type})),
+        score: score,
+        hostId: hostId
+    };
+
+    // host player
+    state.players.push({
+        id: 'host',
+        x: player.x, y: player.y, hp: player.hp, r: player.r, color: player.color
+    });
+
+    // connected clients
+    for (const pid in clientsMap) {
+        const p = clientsMap[pid];
+        state.players.push({ id: pid, x: p.x, y: p.y, hp: p.hp || 100, r: p.r, color: p.color });
+    }
+
+    // send to each connection
+    connections.forEach(conn => {
+        try {
+            conn.send({type:'state', payload: state});
+        } catch(e){
+            // ignore send errors
+        }
+    });
+}
+
+/**
+ * Client: Join a host by id
+ */
+function joinById() {
+    const hostToJoin = document.getElementById('hostIdToJoin').value.trim();
+    if (!hostToJoin) return alert('Enter host id to join');
+    if (clientConn) {
+        try { clientConn.close(); } catch(e){}
+        clientConn = null;
+    }
+    if (!peer) {
+        peer = new Peer();
+        peer.on('open', () => {
+            connectToHost(peer, hostToJoin);
+        });
+        peer.on('error', (e)=>console.error(e));
+    } else {
+        connectToHost(peer, hostToJoin);
+    }
+}
+
+function connectToHost(peerInstance, hostToJoin) {
+    clientConn = peerInstance.connect(hostToJoin);
+    clientConn.on('open', () => {
+        isClient = true;
+        isHost = false;
+        // Notify UI
+        document.getElementById('screens').classList.add('hidden');
+        document.getElementById('startScreen').classList.add('hidden');
+        document.getElementById('gameOverScreen').classList.add('hidden');
+        // send join message
+        clientConn.send({type:'join', payload:{}});
+
+        // start client render loop
+        clientRenderLoop();
+        // start sending inputs periodically
+        startSendingInputsToHost();
+    });
+
+    clientConn.on('data', msg => {
+        if (!msg || !msg.type) return;
+        if (msg.type === 'init') {
+            // store host id if needed
+            hostId = msg.payload.hostId;
+        } else if (msg.type === 'state') {
+            serverState = msg.payload;
+            // update HUD from server snapshot
+            if (serverState && serverState.score !== undefined) {
+                document.getElementById('score').innerText = `SCORE: ${serverState.score}`;
+            }
+            // If server contains host's hp maybe update hp bar based on player's hp; clients don't control hp
+            const hostPlayer = serverState.players.find(p => p.id === 'host');
+            if (hostPlayer) {
+                document.getElementById('hpBar').style.width = `${hostPlayer.hp || 100}%`;
+            }
+        }
+    });
+
+    clientConn.on('close', () => {
+        isClient = false;
+        clientConn = null;
+        serverState = null;
+        stopSendingInputsToHost();
+        // show join screen again
+        document.getElementById('screens').classList.remove('hidden');
+        document.getElementById('joinControls').classList.remove('hidden');
+    });
+
+    clientConn.on('error', e => console.error('clientConn error', e));
+}
+
+/**
+ * Client -> Host: send input regularly
+ */
+let clientInputInterval = null;
+function startSendingInputsToHost() {
+    if (!clientConn) return;
+    if (clientInputInterval) clearInterval(clientInputInterval);
+    clientInputInterval = setInterval(() => {
+        const dxdy = getLocalMovementInput();
+        const shoot = input.mouse.down;
+        const angle = Math.atan2(input.mouse.y - (height/2), input.mouse.x - (width/2)); // best-effort; host uses its own coordinates but we send relative angle
+        clientConn.send({type:'input', payload:{dx: dxdy.dx, dy: dxdy.dy, shoot: shoot, angle: angle}});
+    }, 60); // ~16 times/sec
+}
+function stopSendingInputsToHost() {
+    if (clientInputInterval) {
+        clearInterval(clientInputInterval);
+        clientInputInterval = null;
+    }
+}
+
+/**
+ * Helper: read movement input normalized
+ */
+function getLocalMovementInput() {
+    let dx = 0, dy = 0;
+    if (input.keys['w'] || input.keys['arrowup']) dy = -1;
+    if (input.keys['s'] || input.keys['arrowdown']) dy = 1;
+    if (input.keys['a'] || input.keys['arrowleft']) dx = -1;
+    if (input.keys['d'] || input.keys['arrowright']) dx = 1;
+    if (input.touch.joystickActive) {
+        const jdx = input.touch.currX - input.touch.startX;
+        const jdy = input.touch.currY - input.touch.startY;
+        const dist = Math.sqrt(jdx*jdx + jdy*jdy);
+        const maxDist = 50;
+        const force = Math.min(dist, maxDist) / maxDist;
+        const angle = Math.atan2(jdy, jdx);
+        dx = Math.cos(angle) * force;
+        dy = Math.sin(angle) * force;
+    }
+    return {dx, dy};
+}
+
+/**
+ * UI: update connected players listing for host
+ */
+function updateHostPlayersUI() {
+    if (!playersListEl) return;
+    const list = Object.keys(clientsMap);
+    let html = '';
+    if (list.length === 0) html = '<div class="small">No players connected</div>';
+    else {
+        list.forEach((id,i) => {
+            html += `<div>${i+1}. ${id}</div>`;
+        });
+    }
+    playersListEl.innerHTML = html;
+}
+
+/**
  * MAIN GAME LOOP
  */
 let gameLoopId;
@@ -682,7 +1045,7 @@ function createExplosion(x, y, color, count=15) {
     AudioSys.explode();
 }
 
-function initGame() {
+function initGame(multiplayerMode=false) {
     player = new Player();
     bullets = [];
     particles = [];
@@ -699,6 +1062,8 @@ function initGame() {
 
     // Initial Boxes (fewer at start)
     for (let i = 0; i < maxActiveBoxes; i++) spawnBox();
+
+    // If host, keep clientsMap players as is; host is authoritative
 }
 
 function updateDifficulty() {
@@ -745,6 +1110,38 @@ function update() {
     bullets.forEach(b => b.update());
     particles.forEach(p => p.update());
     enemies.forEach(e => e.update());
+
+    // Host: process inputs coming from clientsMap to update remote players & spawn their bullets
+    if (isHost) {
+        for (const pid in clientsMap) {
+            const p = clientsMap[pid];
+            const inputObj = p.lastInput || {dx:0,dy:0,shoot:false,angle:0};
+            // Apply movement similar to player.update minimal
+            p.vx += inputObj.dx * 0.8;
+            p.vy += inputObj.dy * 0.8;
+            p.vx *= 0.9;
+            p.vy *= 0.9;
+            // cap speed similar to player.speed
+            const sp = Math.sqrt(p.vx*p.vx + p.vy*p.vy);
+            const maxSp = 6;
+            if (sp > maxSp) {
+                const ang = Math.atan2(p.vy, p.vx);
+                p.vx = Math.cos(ang)*maxSp;
+                p.vy = Math.sin(ang)*maxSp;
+            }
+            p.x += p.vx;
+            p.y += p.vy;
+            p.x = Math.max(p.r, Math.min(width - p.r, p.x));
+            p.y = Math.max(p.r, Math.min(height - p.r, p.y));
+
+            // Shooting from client
+            if (inputObj.shoot && (p.cooldown === undefined || p.cooldown <= 0)) {
+                bullets.push(new Bullet(p.x, p.y, inputObj.angle || 0));
+                p.cooldown = p.fireRate;
+            }
+            if (p.cooldown && p.cooldown > 0) p.cooldown--;
+        }
+    }
 
     // Collisions
     
@@ -859,6 +1256,11 @@ function update() {
         gameOver();
         return;
     }
+
+    // Host: periodically broadcast state
+    if (isHost && frame % 6 === 0) {
+        broadcastStateToClients();
+    }
 }
 
 function draw() {
@@ -887,28 +1289,184 @@ function draw() {
     enemies.forEach(e => e.draw(ctx));
     particles.forEach(p => p.draw(ctx));
 
+    // If host, draw remote clients too
+    if (isHost) {
+        for (const pid in clientsMap) {
+            const rp = clientsMap[pid];
+            // simple draw representation
+            ctx.save();
+            ctx.shadowBlur = 20;
+            ctx.shadowColor = rp.color;
+            ctx.fillStyle = rp.color;
+            ctx.beginPath();
+            ctx.arc(rp.x, rp.y, rp.r, 0, Math.PI*2);
+            ctx.fill();
+            ctx.fillStyle = '#fff';
+            ctx.beginPath();
+            ctx.arc(rp.x, rp.y, rp.r*0.5, 0, Math.PI*2);
+            ctx.fill();
+            ctx.restore();
+        }
+    }
+
     ctx.globalCompositeOperation = 'source-over'; // Reset blending
 }
 
 function loop() {
-    update();
+    if (!isClient) update();
     draw();
-    if (player.hp > 0) {
+    if (!isClient && player.hp > 0) {
         gameLoopId = requestAnimationFrame(loop);
+    } else if (!isClient && player.hp <= 0) {
+        // handled by update() gameOver
     }
+}
+
+/**
+ * CLIENT-SIDE RENDER LOOP (receives authoritative snapshots from host)
+ */
+let clientRenderLoopId = null;
+function clientRenderLoop() {
+    // On client we render serverState (if present) each frame
+    function clientFrame() {
+        frame++;
+        // draw snapshot if available
+        if (serverState) {
+            // Use server-provided arrays to render world
+            // Clear & Trail Effect
+            ctx.fillStyle = 'rgba(5, 5, 16, 0.4)';
+            ctx.fillRect(0, 0, width, height);
+
+            ctx.globalCompositeOperation = 'lighter';
+
+            // grid
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
+            ctx.lineWidth = 1;
+            const gridSize = 50;
+            const offset = (frame * 0.5) % gridSize;
+            for (let x = 0; x < width; x+=gridSize) {
+                ctx.beginPath(); ctx.moveTo(x + offset, 0); ctx.lineTo(x + offset, height); ctx.stroke();
+            }
+            for (let y = 0; y < height; y+=gridSize) {
+                ctx.beginPath(); ctx.moveTo(0, y + offset); ctx.lineTo(width, y + offset); ctx.stroke();
+            }
+
+            // boxes
+            serverState.boxes.forEach(b => {
+                ctx.save();
+                ctx.strokeStyle = b.color || '#0ff';
+                ctx.lineWidth = 2;
+                ctx.strokeRect(b.x, b.y, b.w, b.h);
+                ctx.globalAlpha = 0.3;
+                ctx.fillStyle = b.color || '#0ff';
+                const initialMaxHp = b.type === 1 ? 5 : (b.type === 2 ? 1 : 2);
+                const fillH = ((b.hp||0) / initialMaxHp) * b.h;
+                ctx.fillRect(b.x, b.y + (b.h - fillH), b.w, fillH);
+                ctx.globalAlpha = 1;
+                ctx.restore();
+            });
+
+            // powerups
+            serverState.powerups.forEach(p => {
+                const color = p.type === 'hp' ? '#0f0' : '#ff0';
+                ctx.save();
+                ctx.shadowBlur = 15;
+                ctx.shadowColor = color;
+                ctx.fillStyle = color;
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.restore();
+            });
+
+            // bullets
+            (serverState.bullets || []).forEach(b => {
+                ctx.save();
+                ctx.shadowBlur = 10;
+                ctx.shadowColor = b.color || '#fff';
+                ctx.fillStyle = b.color || '#fff';
+                ctx.beginPath();
+                ctx.arc(b.x, b.y, b.r, 0, Math.PI*2);
+                ctx.fill();
+                ctx.restore();
+            });
+
+            // enemies
+            (serverState.enemies || []).forEach(e => {
+                ctx.save();
+                ctx.shadowBlur = 10;
+                ctx.shadowColor = e.color || '#f00';
+                ctx.strokeStyle = e.color || '#f00';
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                ctx.moveTo(e.x + Math.cos(0)*e.r, e.y + Math.sin(0)*e.r);
+                ctx.lineTo(e.x + Math.cos(2.09)*e.r, e.y + Math.sin(2.09)*e.r);
+                ctx.lineTo(e.x + Math.cos(4.18)*e.r, e.y + Math.sin(4.18)*e.r);
+                ctx.closePath();
+                ctx.stroke();
+                ctx.restore();
+            });
+
+            // players
+            (serverState.players || []).forEach(p => {
+                ctx.save();
+                ctx.shadowBlur = 20;
+                ctx.shadowColor = p.color || '#0ff';
+                ctx.fillStyle = p.color || '#0ff';
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, p.r || 12, 0, Math.PI*2);
+                ctx.fill();
+                ctx.fillStyle = '#fff';
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, (p.r||12)*0.5, 0, Math.PI*2);
+                ctx.fill();
+                ctx.restore();
+            });
+
+            // HUD update
+            document.getElementById('score').innerText = `SCORE: ${serverState.score || 0}`;
+            // host player's hp if present:
+            const hostP = (serverState.players || []).find(p=>p.id==='host');
+            if (hostP) document.getElementById('hpBar').style.width = `${hostP.hp||100}%`;
+            
+            ctx.globalCompositeOperation = 'source-over';
+        } else {
+            // fallback: simple clear
+            ctx.fillStyle = 'rgba(5, 5, 16, 0.4)';
+            ctx.fillRect(0, 0, width, height);
+        }
+
+        clientRenderLoopId = requestAnimationFrame(clientFrame);
+    }
+
+    clientFrame();
 }
 
 /**
  * GAME STATE MANAGEMENT
  */
-function startGame() {
+function startGame(mode) {
+    // mode === 'host' => host multiplayer (authoritative)
     document.getElementById('screens').classList.add('hidden');
     document.getElementById('startScreen').classList.add('hidden');
     document.getElementById('gameOverScreen').classList.add('hidden');
-    
+
     AudioSys.init(); // Initialize audio context on user interaction
     initGame();
-    loop();
+
+    if (mode === 'host') {
+        // ensure we are hosting
+        if (!peer) startHosting();
+        isHost = true;
+        isClient = false;
+        // host will run authoritative update loop
+        loop();
+    } else {
+        // singleplayer
+        isHost = false;
+        isClient = false;
+        loop();
+    }
 }
 
 function gameOver() {
@@ -942,6 +1500,19 @@ function updateLeaderboard(newScore) {
 
 // Initial Leaderboard Load
 updateLeaderboard(0);
+
+/**
+ * If the page was opened with a "?join=<id>" parameter, pre-fill the join box
+ * and attempt to auto-join on user action (the user must press JOIN to start audio / input loops).
+ */
+(function autoJoinFromUrl() {
+    const params = new URLSearchParams(window.location.search);
+    const j = params.get('join');
+    if (j) {
+        document.getElementById('hostIdToJoin').value = j;
+        openJoinPanel();
+    }
+})();
 
 </script>
 </body>
